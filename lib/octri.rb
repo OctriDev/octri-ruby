@@ -157,8 +157,8 @@ module Octri
                      service: "server", operation_id: nil, end_time: nil, status: "ok")
       return if @config.nil?
 
-      payload = { traceId: trace_id, spanId: span_id, name: name, service: service,
-                  startTime: start_time, status: status }
+      payload = { traceId: trace_id, spanId: span_id, environment: @config.environment,
+                  name: name, service: service, startTime: start_time, status: status }
       payload[:parentSpanId] = parent_span_id if parent_span_id
       payload[:endTime] = end_time if end_time
       payload[:operationId] = operation_id if operation_id
