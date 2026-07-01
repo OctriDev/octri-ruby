@@ -98,6 +98,35 @@ module Octri
       end
     end
 
+    # ── Automatic instrumentation ─────────────────────────────────────────────
+    # Wrap the given methods so every call becomes a sub-span. Point it at a DB
+    # client, cache, or util class once and all calls are traced without per-call
+    # code. `target` may be a Class/Module (wraps instance methods) or an object
+    # (wraps its singleton methods).
+    #
+    #   Octri.instrument(PG::Connection, [:exec, :exec_params], op: "db")
+    #   Octri.instrument(cache, [:get, :set], op: "cache")
+    def instrument(target, methods, op: nil, name: nil)
+      mod = Module.new
+      owner = target.is_a?(Module) ? target : target.singleton_class
+      methods.each do |method_name|
+        next unless owner.method_defined?(method_name) || owner.private_method_defined?(method_name)
+
+        mod.define_method(method_name) do |*args, **kwargs, &blk|
+          span_name = name ? name.call(method_name, args) : method_name.to_s
+          Octri.span(span_name, op: op) { super(*args, **kwargs, &blk) }
+        end
+      end
+      owner.prepend(mod)
+      target
+    end
+
+    # Turn on zero-config tracing for outbound HTTP (Net::HTTP). Calls to your
+    # monitoring backend are never traced (no feedback loop).
+    def auto_instrument(http: true)
+      patch_net_http if http
+    end
+
     # ── Reporting ──────────────────────────────────────────────────────────────
     def capture_error(exception, trace: nil, method: nil, path: nil, status_code: nil, level: "error")
       return if @config.nil?
@@ -140,7 +169,26 @@ module Octri
       Time.now.utc.iso8601(3)
     end
 
+    # True when host:port is the monitoring backend — used to avoid tracing our
+    # own reporting requests (which would recurse).
+    def monitoring_endpoint?(host, port)
+      return false if @config.nil? || @config.url.nil?
+
+      uri = URI(@config.url)
+      uri.host == host && uri.port == port
+    rescue StandardError
+      false
+    end
+
     private
+
+    def patch_net_http
+      require "net/http"
+      return if Net::HTTP.instance_variable_get(:@octri_patched)
+
+      Net::HTTP.prepend(NetHTTPPatch)
+      Net::HTTP.instance_variable_set(:@octri_patched, true)
+    end
 
     def trace_from_current
       ctx = current_span
@@ -213,6 +261,22 @@ module Octri
       rescue StandardError
         # A reporting failure must never affect the app.
       end
+    end
+  end
+
+  # Prepended to Net::HTTP by auto_instrument: wraps outbound requests in an
+  # `http` span (skipping requests to the monitoring backend, and when there's no
+  # active request span).
+  module NetHTTPPatch
+    def request(req, body = nil, &block)
+      cfg = Octri.config
+      if cfg.nil? || Octri.current_span.nil? || Octri.monitoring_endpoint?(address, port)
+        return super
+      end
+
+      path = req.respond_to?(:path) ? req.path : ""
+      method = req.respond_to?(:method) ? req.method : "GET"
+      Octri.span("#{method} #{address}:#{port}#{path}", op: "http") { super }
     end
   end
 

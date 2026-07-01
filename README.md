@@ -28,6 +28,18 @@ use Octri::Rack
 `Octri::Rack` captures any exception raised by the app (linked to the request's
 trace) and re-raises, and times the request as a server span.
 
+## Automatic instrumentation
+
+```ruby
+Octri.auto_instrument                            # traces outbound Net::HTTP calls
+Octri.instrument(PG::Connection, [:exec], op: "db")  # your DB client / util class, once
+Octri.instrument(cache, [:get, :set], op: "cache")
+```
+
+Every instrumented call (and every outbound HTTP request) becomes a sub-span
+under the current request — no per-call code. Calls to your monitoring backend
+are never traced (no feedback loop).
+
 ## Sub-spans (where time goes)
 
 ```ruby
