@@ -24,11 +24,13 @@ module Octri
   Trace = Struct.new(:trace_id, :parent_span_id)
 
   CONTEXT_LINES = 5
+  REQUEST_TIMEOUT_SECONDS = 5
+  MAX_IDEMPOTENCY_KEY_LENGTH = 256
   TRACEPARENT_RE = /\A00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}\z/i.freeze
 
   class << self
     # Configure the reporter. Call once at startup before mounting the middleware.
-    def init(url:, token:, environment:, release: nil)
+    def init(url:, token: nil, environment:, release: nil)
       @config = Config.new(url.sub(%r{/+\z}, ""), token, environment, release)
       @source_cache = {}
       @config
@@ -43,7 +45,10 @@ module Octri
     # ── Trace context (W3C) ──────────────────────────────────────────────────
     def trace_from_header(traceparent)
       if traceparent && (m = traceparent.to_s.strip.match(TRACEPARENT_RE))
-        Trace.new(m[1], m[2])
+        unless all_zeros?(m[1]) || all_zeros?(m[2])
+          return Trace.new(m[1].downcase, m[2].downcase)
+        end
+        Trace.new(SecureRandom.hex(16), nil)
       else
         Trace.new(SecureRandom.hex(16), nil)
       end
@@ -128,12 +133,51 @@ module Octri
     end
 
     # ── Reporting ──────────────────────────────────────────────────────────────
+    # Log an application event directly, without a generated Octri API SDK.
+    # Delivery is fire-and-forget; event_id may be supplied for idempotency.
+    def capture_event(message, level: "info", timestamp: nil, operation_id: nil,
+                      method: nil, path: nil, status_code: nil, latency_ms: nil,
+                      attempt: nil, request_id: nil, user: nil, tags: nil,
+                      context: nil, breadcrumbs: nil, fingerprint: nil, trace: nil,
+                      span_id: nil, event_id: nil)
+      return if @config.nil?
+
+      resolved_event_id = resolve_event_id(event_id)
+      payload = {
+        eventId: resolved_event_id,
+        timestamp: timestamp || now_iso,
+        level: level,
+        message: message,
+        environment: @config.environment,
+        tags: { "octri.origin" => "standalone" }.merge(tags || {})
+      }
+      payload[:release] = @config.release if @config.release
+      payload[:operationId] = operation_id if operation_id
+      payload[:method] = method if method
+      payload[:path] = path if path
+      payload[:statusCode] = status_code unless status_code.nil?
+      payload[:latencyMs] = latency_ms unless latency_ms.nil?
+      payload[:attempt] = attempt unless attempt.nil?
+      payload[:requestId] = request_id if request_id
+      payload[:user] = user if user
+      payload[:context] = context if context
+      payload[:breadcrumbs] = breadcrumbs if breadcrumbs
+      payload[:fingerprint] = fingerprint if fingerprint
+      payload[:traceId] = trace.trace_id if trace
+      payload[:spanId] = span_id if span_id
+      post_json("/ingest", payload, idempotency_key: resolved_event_id)
+    rescue StandardError
+      # Invalid caller data must never affect the host application.
+      nil
+    end
+
     def capture_error(exception, trace: nil, method: nil, path: nil, status_code: nil, level: "error")
       return if @config.nil?
 
       tr = trace || trace_from_current
+      event_id = SecureRandom.hex(16)
       payload = {
-        eventId: SecureRandom.hex(8),
+        eventId: event_id,
         timestamp: now_iso,
         level: level,
         environment: @config.environment,
@@ -150,19 +194,30 @@ module Octri
       payload[:method] = method if method
       payload[:path] = path if path
       payload[:statusCode] = status_code if status_code
-      post_json("/ingest", payload)
+      post_json("/ingest", payload, idempotency_key: event_id)
+    rescue StandardError
+      # Invalid exception-like objects must not affect the host application.
+      nil
     end
 
     def capture_span(trace_id:, span_id:, name:, start_time:, parent_span_id: nil,
                      service: "server", operation_id: nil, end_time: nil, status: "ok")
       return if @config.nil?
+      return unless valid_required_span_value?(trace_id) && valid_required_span_value?(span_id) &&
+                    valid_required_span_value?(name) && valid_iso_time?(start_time)
+      return if end_time && !valid_iso_time?(end_time)
+      return if (trace_id.length == 32 && all_zeros?(trace_id)) ||
+                (span_id.length == 16 && all_zeros?(span_id))
 
       payload = { traceId: trace_id, spanId: span_id, environment: @config.environment,
                   name: name, service: service, startTime: start_time, status: status }
       payload[:parentSpanId] = parent_span_id if parent_span_id
       payload[:endTime] = end_time if end_time
       payload[:operationId] = operation_id if operation_id
-      post_json("/traces", payload)
+      post_json("/traces", payload, idempotency_key: "#{trace_id}:#{span_id}")
+    rescue StandardError
+      # Invalid caller data must never affect the host application.
+      nil
     end
 
     def now_iso
@@ -181,6 +236,36 @@ module Octri
     end
 
     private
+
+    def all_zeros?(value)
+      value.is_a?(String) && !value.empty? && value.each_char.all? { |char| char == "0" }
+    end
+
+    def safe_header_value?(value)
+      value.is_a?(String) && !value.empty? && !value.include?("\r") && !value.include?("\n")
+    end
+
+    def safe_idempotency_key?(value)
+      safe_header_value?(value) && value.bytesize <= MAX_IDEMPOTENCY_KEY_LENGTH
+    end
+
+    def resolve_event_id(value)
+      candidate = value.is_a?(String) ? value.strip : ""
+      safe_idempotency_key?(candidate) ? candidate : SecureRandom.hex(16)
+    end
+
+    def valid_required_span_value?(value)
+      value.is_a?(String) && !value.strip.empty?
+    end
+
+    def valid_iso_time?(value)
+      return false unless valid_required_span_value?(value)
+
+      Time.iso8601(value)
+      true
+    rescue ArgumentError
+      false
+    end
 
     def patch_net_http
       require "net/http"
@@ -242,24 +327,33 @@ module Octri
       lines
     end
 
-    def post_json(path, payload)
+    def post_json(path, payload, idempotency_key:)
       cfg = @config
       return if cfg.nil?
+      return unless safe_idempotency_key?(idempotency_key)
+      return if cfg.token && cfg.token != "" && !safe_header_value?(cfg.token)
 
-      body = JSON.generate(payload)
-      Thread.new do
-        uri = URI("#{cfg.url}#{path}")
-        http = Net::HTTP.new(uri.host, uri.port)
-        http.use_ssl = uri.scheme == "https"
-        http.open_timeout = 5
-        http.read_timeout = 5
-        req = Net::HTTP::Post.new(uri)
-        req["content-type"] = "application/json"
-        req["authorization"] = "Bearer #{cfg.token}"
-        req.body = body
-        http.request(req)
+      begin
+        Thread.new do
+          body = JSON.generate(payload)
+          uri = URI("#{cfg.url}#{path}")
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.use_ssl = uri.scheme == "https"
+          http.open_timeout = REQUEST_TIMEOUT_SECONDS
+          http.read_timeout = REQUEST_TIMEOUT_SECONDS
+          http.write_timeout = REQUEST_TIMEOUT_SECONDS if http.respond_to?(:write_timeout=)
+          req = Net::HTTP::Post.new(uri)
+          req["content-type"] = "application/json"
+          req["idempotency-key"] = idempotency_key
+          req["authorization"] = "Bearer #{cfg.token}" if cfg.token && cfg.token != ""
+          req.body = body
+          http.request(req)
+        rescue StandardError
+          # A reporting failure must never affect the app.
+        end
       rescue StandardError
-        # A reporting failure must never affect the app.
+        # Thread exhaustion must not make monitoring affect the application.
+        nil
       end
     end
   end

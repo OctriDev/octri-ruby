@@ -25,6 +25,26 @@ Octri.init(
 use Octri::Rack
 ```
 
+Hosted users can copy the project-scoped URL, token, and environment from the
+Monitoring connection settings (or its API). Omit `token:` only when pointing
+at an open self-hosted ingest endpoint. Every request carries an idempotency key.
+
+## Standalone events
+
+No generated API SDK is required to send your own events:
+
+```ruby
+Octri.capture_event(
+  "checkout.completed",
+  user: { id: customer.id },
+  tags: { region: "eu-west", plan: "growth" },
+  context: { order_id: order.id, total: order.total }
+)
+```
+
+Delivery is best-effort and runs on a background thread. Pass `event_id:` to
+make a retried delivery idempotent.
+
 `Octri::Rack` captures any exception raised by the app (linked to the request's
 trace) and re-raises, and times the request as a server span.
 
