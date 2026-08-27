@@ -9,7 +9,14 @@ Gem::Specification.new do |s|
                   "the request waterfall."
   s.authors = ["Octri"]
   s.license = "MIT"
-  s.files = Dir["lib/**/*.rb", "README.md"]
+  s.homepage = "https://octri.dev"
+  s.metadata = {
+    "homepage_uri" => "https://octri.dev",
+    "documentation_uri" => "https://docs.octri.dev/docs",
+    "bug_tracker_uri" => "https://octri.dev/support",
+    "source_code_uri" => "https://github.com/octridev/octri-ruby"
+  }
+  s.files = Dir["lib/**/*.rb", "README.md", "LICENSE"]
   s.require_paths = ["lib"]
   s.required_ruby_version = ">= 2.7"
 end
