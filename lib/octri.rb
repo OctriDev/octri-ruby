@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
-# Octri — server-side error monitoring for Ruby backends.
+# Octri: server-side error monitoring for Ruby backends.
 #
 # Add it to your live API; it reports backend errors to your Octri monitoring
 # project (with original-source context per stack frame) and links each one to
-# the client SDK error for the same request via the W3C `traceparent` header —
+# the client SDK error for the same request via the W3C `traceparent` header,
 # so the dashboard shows the full client -> server stack under one trace. It also
 # times requests (and any sub-spans you open) into the request waterfall.
 #
@@ -14,6 +14,7 @@
 #   use Octri::Rack
 
 require "securerandom"
+require "set"
 require "net/http"
 require "uri"
 require "json"
@@ -24,9 +25,30 @@ module Octri
   Trace = Struct.new(:trace_id, :parent_span_id)
 
   CONTEXT_LINES = 5
+  MAX_SOURCE_BYTES = 512 * 1024
+  MAX_CACHED_SOURCES = 256
   REQUEST_TIMEOUT_SECONDS = 5
   MAX_IDEMPOTENCY_KEY_LENGTH = 256
   TRACEPARENT_RE = /\A00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}\z/i.freeze
+
+  # Keys whose value never leaves the process. Compared against the key with case
+  # and separators removed, so `api_key`, `apiKey` and `API-KEY` all match
+  # `apikey`, and the test is a substring one, so `stripe_secret_key` matches too.
+  SCRUB_KEYS = %w[
+    password passwd passphrase secret token apikey authorization credential
+    cookie session privatekey accesskey cardnumber creditcard cvv ssn
+  ].freeze
+
+  REDACTED = "[redacted]"
+  TRUNCATED = "[truncated]"
+  CIRCULAR = "[circular]"
+  # Deep enough for real context objects, shallow enough to stay cheap.
+  MAX_SCRUB_DEPTH = 8
+
+  BEARER_RE = %r{\bbearer\s+[\w.~+/-]+=*}i.freeze
+  JWT_RE = /\beyJ[\w-]+\.[\w-]+\.[\w-]+/.freeze
+  DIGIT_RUN_RE = /\b(?:\d[ -]?){12,18}\d\b/.freeze
+  EMAIL_RE = /[\w.%+-]+@[\w-]+(?:\.[\w-]+)+/.freeze
 
   class << self
     # Configure the reporter. Call once at startup before mounting the middleware.
@@ -132,6 +154,33 @@ module Octri
       patch_net_http if http
     end
 
+    # ── Scrubbing ─────────────────────────────────────────────────────────────
+
+    # Redact more key names, on top of the built-in list. Matching ignores case
+    # and separators and is a substring test, so `account` also covers
+    # `account_number`.
+    #
+    #   Octri.add_scrub_fields("account_number", "otp")
+    def add_scrub_fields(*fields)
+      @extra_scrub_keys ||= []
+      fields.flatten.each do |field|
+        key = normalize_key(field)
+        @extra_scrub_keys << key unless key.empty? || @extra_scrub_keys.include?(key)
+      end
+      @extra_scrub_keys
+    end
+
+    # Run a block on every payload just before it is sent. Return the payload
+    # (editing it in place is fine) to send it, or nil to drop the event:
+    #
+    #   Octri.set_before_send { |payload| payload[:path] == "/health" ? nil : payload }
+    #
+    # Redaction still runs afterwards, so a hook cannot leak a credential by
+    # accident. Call it without a block to remove the hook.
+    def set_before_send(&hook)
+      @before_send = hook
+    end
+
     # ── Reporting ──────────────────────────────────────────────────────────────
     # Log an application event directly, without a generated Octri API SDK.
     # Delivery is fire-and-forget; event_id may be supplied for idempotency.
@@ -224,7 +273,7 @@ module Octri
       Time.now.utc.iso8601(3)
     end
 
-    # True when host:port is the monitoring backend — used to avoid tracing our
+    # True when host:port is the monitoring backend, used to avoid tracing our
     # own reporting requests (which would recurse).
     def monitoring_endpoint?(host, port)
       return false if @config.nil? || @config.url.nil?
@@ -292,7 +341,8 @@ module Octri
         path = loc.absolute_path || loc.path
         lineno = loc.lineno
         frame = { function: loc.label, filename: path, lineno: lineno, colno: 0, inApp: in_app?(path) }
-        lines = read_source(path)
+        # Only your own files: the dashboard shows them, gem source is noise.
+        lines = frame[:inApp] ? read_source(path) : nil
         if lines && lineno >= 1 && lineno <= lines.length
           idx = lineno - 1
           frame[:contextLine] = lines[idx]
@@ -319,12 +369,100 @@ module Octri
       return @source_cache[path] if @source_cache.key?(path)
 
       lines = begin
-        File.readlines(path, chomp: true)
+        # Big files are skipped, not truncated, so line numbers keep lining up.
+        File.size(path) <= MAX_SOURCE_BYTES ? File.readlines(path, chomp: true) : nil
       rescue StandardError
         nil
       end
+      # A stack can name any number of files, so the cache is bounded too.
+      @source_cache.shift if @source_cache.size >= MAX_CACHED_SOURCES
       @source_cache[path] = lines
       lines
+    end
+
+    def normalize_key(key)
+      key.to_s.downcase.gsub(/[^a-z0-9]/, "")
+    end
+
+    def secret_key?(key)
+      normalized = normalize_key(key)
+      return false if normalized.empty?
+
+      SCRUB_KEYS.any? { |candidate| normalized.include?(candidate) } ||
+        (@extra_scrub_keys || []).any? { |candidate| normalized.include?(candidate) }
+    end
+
+    # Tells a card number from the order ids and timestamps that look like one.
+    def passes_luhn?(digits)
+      sum = 0
+      double = false
+      digits.reverse.each_char do |char|
+        digit = char.ord - 48
+        if double
+          digit *= 2
+          digit -= 9 if digit > 9
+        end
+        sum += digit
+        double = !double
+      end
+      (sum % 10).zero?
+    end
+
+    # Removes credentials and personal data that leaked into free text.
+    def scrub_text(value)
+      return value if value.empty?
+
+      value
+        .gsub(BEARER_RE, REDACTED)
+        .gsub(JWT_RE, REDACTED)
+        .gsub(DIGIT_RUN_RE) { |run| passes_luhn?(run.delete("^0-9")) ? REDACTED : run }
+        .gsub(EMAIL_RE, REDACTED)
+    end
+
+    # Redacts credential-shaped keys anywhere in the payload, and strips secrets
+    # out of the free text around them. `user` is the field you deliberately fill
+    # with an identity, so its strings are left alone; its keys are still checked.
+    def scrub_value(value, depth, text, seen)
+      case value
+      when String
+        text ? scrub_text(value) : value
+      when Hash, Array
+        return TRUNCATED if depth >= MAX_SCRUB_DEPTH
+        # Walking a copy means a cycle would recurse forever, and a context hash
+        # holding a reference back to itself is worth surviving.
+        return CIRCULAR if seen.include?(value.object_id)
+
+        seen.add(value.object_id)
+        begin
+          scrub_collection(value, depth, text, seen)
+        ensure
+          seen.delete(value.object_id)
+        end
+      else
+        value
+      end
+    end
+
+    def scrub_collection(value, depth, text, seen)
+      return value.map { |item| scrub_value(item, depth + 1, text, seen) } if value.is_a?(Array)
+
+      value.each_with_object({}) do |(key, nested), out|
+        out[key] = if secret_key?(key)
+                     REDACTED
+                   else
+                     scrub_value(nested, depth + 1, text && key.to_s != "user", seen)
+                   end
+      end
+    end
+
+    # The last thing every payload passes through. Both the hook and the
+    # redaction live here rather than in the capture methods, so nothing can be
+    # reported around them.
+    def scrub_payload(payload)
+      hooked = @before_send ? @before_send.call(payload) : payload
+      return nil unless hooked.is_a?(Hash)
+
+      scrub_value(hooked, 0, true, Set.new)
     end
 
     def post_json(path, payload, idempotency_key:)
@@ -333,9 +471,12 @@ module Octri
       return unless safe_idempotency_key?(idempotency_key)
       return if cfg.token && cfg.token != "" && !safe_header_value?(cfg.token)
 
+      scrubbed = scrub_payload(payload)
+      return if scrubbed.nil?
+
       begin
         Thread.new do
-          body = JSON.generate(payload)
+          body = JSON.generate(scrubbed)
           uri = URI("#{cfg.url}#{path}")
           http = Net::HTTP.new(uri.host, uri.port)
           http.use_ssl = uri.scheme == "https"

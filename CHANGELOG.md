@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.0
+
+- Payloads are now scrubbed before they are sent. Values under keys that name a
+  credential (`password`, `secret`, `token`, `apiKey`, `authorization`,
+  `cookie`, `ssn` and the rest) are replaced with `[redacted]` at any depth, and
+  free text is swept for bearer tokens, JWTs, Luhn-valid card numbers and email
+  addresses.
+- `add_scrub_fields` adds your own key names to that list.
+- `set_before_send` hands you each payload before it goes out; return
+  `nil` to drop the event. Redaction runs after the hook.
+- The `user` field keeps the identity you set, since that is the point of it.
+  Credential-shaped keys inside it are still redacted.
+
+## 1.0.1
+
+- Source context is now read only for frames in your own code, skips files
+  over 512 KB, and keeps a bounded cache, so a deep or unusual stack cannot
+  pull dependency source into a report or grow memory without limit.
+
 ## 1.0.0
 
 First public release.

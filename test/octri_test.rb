@@ -80,6 +80,17 @@ class OctriStandaloneEventTest < Minitest::Test
     end
   end
 
+  def test_source_context_is_limited_to_in_app_frames
+    frames = begin
+      JSON.parse("{")
+    rescue StandardError => error
+      Octri.send(:build_frames, error)
+    end
+
+    assert frames.any? { |frame| frame[:inApp] && frame[:contextLine] }
+    refute frames.any? { |frame| !frame[:inApp] && frame[:contextLine] }
+  end
+
   def test_invalid_spans_are_suppressed
     captured = []
     singleton = Octri.singleton_class

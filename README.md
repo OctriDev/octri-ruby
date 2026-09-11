@@ -102,6 +102,39 @@ end
 
 ---
 
+## What gets redacted
+
+Payloads are scrubbed on the way out, so a credential that ended up in a log
+line or a context object never reaches the dashboard.
+
+Any key whose name looks like a credential (`password`, `secret`, `token`,
+`apiKey`, `authorization`, `cookie`, `ssn` and the rest of the usual list) has
+its value replaced with `[redacted]`, at any depth. Matching ignores case and
+separators, so `api_key`, `apiKey` and `X-API-KEY` are all the same key.
+
+Free text is swept too: the message, an error message and its stack, and
+anything else you send as a string. Bearer tokens, JWTs, card numbers and email
+addresses come out as `[redacted]`. A card number has to pass the Luhn check
+first, so an order number or a timestamp survives.
+
+`user` is the exception. It is the field you fill with an identity on purpose,
+so `user.email` is reported exactly as you set it. Credential-shaped keys inside
+it are still redacted.
+
+Add your own key names:
+
+```ruby
+Octri.add_scrub_fields("account_number", "otp")
+```
+
+Or take the payload yourself, and return `nil` to drop the event:
+
+```ruby
+Octri.set_before_send { |payload| payload[:path] == "/health" ? nil : payload }
+```
+
+Redaction runs after your hook, so a hook cannot leak a credential by accident.
+
 ## The rest of Octri
 
 | Product | What it does |
