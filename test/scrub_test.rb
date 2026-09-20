@@ -90,12 +90,25 @@ class OctriScrubTest < Minitest::Test
 
   # ── The user field ──────────────────────────────────────────────────────────
 
-  def test_user_identity_survives_but_user_credentials_do_not
-    user = scrub(user: { id: "u_1", email: "ada@example.com", session_token: "st_1" })[:user]
+  # The identity the dashboard keys on is `id`, which survives. Direct
+  # identifiers under the user are redacted like they are in every generated SDK.
+  def test_user_id_survives_but_user_credentials_and_identifiers_do_not
+    user = scrub(user: { id: "u_1", email: "ada@example.com", session_token: "st_1", customerPhone: "+1 555 0100" })[:user]
 
-    assert_equal "ada@example.com", user[:email]
     assert_equal "u_1", user[:id]
+    assert_equal "[redacted]", user[:email]
     assert_equal "[redacted]", user[:session_token]
+    assert_equal "[redacted]", user[:customerPhone]
+  end
+
+  def test_identifier_words_inside_longer_keys_are_redacted
+    context = scrub(context: { billingAddress: { line1: "1 High St" }, shipping_first_name: "Ada",
+                               avatarUrl: "https://cdn.example.com/a.png", queryTimeMs: 12 })[:context]
+
+    assert_equal "[redacted]", context[:billingAddress]
+    assert_equal "[redacted]", context[:shipping_first_name]
+    assert_equal "https://cdn.example.com/a.png", context[:avatarUrl]
+    assert_equal 12, context[:queryTimeMs]
   end
 
   # ── before_send ─────────────────────────────────────────────────────────────
